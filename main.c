@@ -4,6 +4,8 @@
 #include <sys/stat.h>
 #include <sys/fcntl.h>
 #include <string.h>
+#include <signal.h>
+#include "request.h"
 
 /**
  * Client server fifo
@@ -35,6 +37,16 @@
 int g_exec_monitor[7][2];
 
 /**
+ * Global variable that contains information of current tasks
+ */
+int g_task_monitor[32][2];
+
+/**
+ * Global variable representing the current number of next running task
+ */
+int g_curr_task;
+
+/**
  * Global variable that contains paths to the executables
  */
 char *g_exec_commands[7];
@@ -43,6 +55,13 @@ char *g_exec_commands[7];
  * Global variable that serves as buffer for reads
  */
 char g_buffer[MAX_BUFFER];
+
+/**
+ * Global variable indicating server status
+ */
+int g_running_status;
+
+pid_t g_manager;
 
 /**
  * Enum representing transformations
@@ -55,8 +74,32 @@ typedef enum {
     G_DECOMPRESS,
     ENCRYPT,
     DECRYPT,
-    INVALID = -1
+    INVALID_TC = -1
 }TRANSFORM;
+
+typedef enum {
+    PROC_FILE,
+    STATUS,
+    INVALID_OP = -1
+}OPTION;
+
+typedef enum {
+    DONE,
+    PENDING,
+    PROCESSING
+}TASK_STATUS;
+
+/**
+ * Enum representing server status.
+ */
+typedef enum {
+    SHUTDOWN,
+    ONLINE
+}SERVER_STATUS;
+
+void sigtermHandler(int signum){
+    g_running_status = SHUTDOWN;
+}
 
 /**
  * Handles an error by exiting with code EXIT_FAILURE. Also unlinks fifo if opened.
@@ -141,16 +184,28 @@ int openFileDescriptor(char *path , int mode){
 }
 
 /**
- * Writes a string to a file
+ * Read a string from a file
  * @param fd file descriptor
  * @param buffer buffer to write
  * @param buffer_size size of buffer
  * @return bytes written to file
  */
 ssize_t readFromFile(int fd, char *buffer , size_t buffer_size){
-    ssize_t bytes_read = read(fd,buffer,strlen(buffer));
+    ssize_t bytes_read = read(fd,buffer,buffer_size);
     errorHandler((int)bytes_read,"Error reading from file.");
     return bytes_read;
+}
+
+/**
+ * Writes a string to a file
+ * @param fd file descriptor
+ * @param str string to write
+ * @return bytes written to file
+ */
+ssize_t writeToFile(int fd, char *str){
+    ssize_t bytes_wrote = write(fd,str,strlen(str)+1);
+    errorHandler((int)bytes_wrote,"Error writing to file.");
+    return bytes_wrote;
 }
 
 /**
@@ -180,7 +235,7 @@ int initBinPath(const char *path){
 }
 
 TRANSFORM parseTransform(char *str){
-    TRANSFORM t_code = INVALID;
+    TRANSFORM t_code = INVALID_TC;
 
     if(!strcmp(str,"nop")){
         t_code = NOP;
@@ -197,7 +252,7 @@ TRANSFORM parseTransform(char *str){
     }else if(!strcmp(str,"decrypt")){
         t_code = DECRYPT;
     }else{
-        t_code = INVALID;
+        t_code = INVALID_TC;
     }
     errorHandler(t_code,"Invalid transformation.\n");
     return t_code;
@@ -224,10 +279,35 @@ int initExecMonitor(char *path_to_config){
     if(line != NULL){
         free(line);
     }
+    close(fd);
     return 0;
 }
 
+void processFile(char **args){
+    long t = strtol(strsep(args," "),NULL,10);
+    int fd_in = openFileDescriptor(strsep(args," "),O_RDONLY);
+    int path_out = open(strsep(args," "),O_WRONLY | O_CREAT,0777);
+
+    pid_t pid = fork();
+
+    if(pid == 0){
+        _exit(0);
+    }
+}
+
+void assignRequest(REQUEST request){
+
+        int fd = openFileDescriptor(CLIENT_SERVER,O_WRONLY);
+        kill(getRequestSender(request),SIGUSR1);
+        sleep(1);
+        close(fd);
+
+
+}
+
 int main(int argc , char *argv[]) {
+    signal(SIGTERM,sigtermHandler);
+
     if(argc < 3){
         errorHandler(-1,"Invalid argument size.\n");
     }
@@ -237,8 +317,32 @@ int main(int argc , char *argv[]) {
     initExecMonitor(CONFIG_ARG(argv));
     initBinPath(BIN_PATH_ARG(argv));
 
-    int fd = openFileDescriptor(CLIENT_SERVER,O_RDONLY);
-
+    g_running_status = ONLINE;
+    while(g_running_status == ONLINE){
+        REQUEST request = NULL;
+        int fd = openFileDescriptor(CLIENT_SERVER,O_RDONLY);
+        readRequest(fd,&request);
+        close(fd);
+        char fifo[1024];
+        sprintf(fifo,"/tmp/%d", getRequestSender(request));
+        switch (getRequestType(request)) {
+            case PROC_FILE:
+                g_task_monitor[g_curr_task][0] = getRequestSender(request);
+                g_task_monitor[g_curr_task][1] = fork();
+                if(g_task_monitor[g_curr_task][1] == 0){
+                    fd = openFileDescriptor(fifo,O_WRONLY);
+                    kill(getRequestSender(request),SIGUSR1);
+                    _exit(0);
+                }
+                g_curr_task++;
+                break;
+            case STATUS:
+                break;
+            default:
+                errorHandler(INVALID_OP,"invalid operation.\n");
+                break;
+        }
+    }
     unlink(CLIENT_SERVER);
     return 0;
 }
