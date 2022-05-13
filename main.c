@@ -5,7 +5,16 @@
 #include <sys/fcntl.h>
 #include <string.h>
 #include <signal.h>
-#include "request.h"
+#include <sys/wait.h>
+
+typedef struct request {
+    char sender[1024];
+    int type;
+    int pipes;
+    int items[100];
+    char input_path[1024];
+    char output_path[1024];
+}REQUEST;
 
 /**
  * Client server fifo
@@ -268,11 +277,8 @@ int initExecMonitor(char *path_to_config){
         char *tokens = line;
         char *exec = strsep(&tokens," ");
         char *max_exec = strsep(&tokens," ");
-        errorHandler(exec == NULL ? -1 : 0,"strsep error");
-        errorHandler(max_exec == NULL ? -1 : 0,"strsep error");
         TRANSFORM t_code = parseTransform(exec);
         long m = strtol(max_exec,&rest,10);
-        errorHandler(strlen(rest) == 1 && *rest == '\n' ? 0 : -1,"Error parsing max.\n");
         g_exec_monitor[t_code][EXEC_MAX] = (int)m;
         g_exec_monitor[t_code][EXEC_CURR] = 0;
     }
@@ -283,26 +289,63 @@ int initExecMonitor(char *path_to_config){
     return 0;
 }
 
-void processFile(char **args){
-    long t = strtol(strsep(args," "),NULL,10);
-    int fd_in = openFileDescriptor(strsep(args," "),O_RDONLY);
-    int path_out = open(strsep(args," "),O_WRONLY | O_CREAT,0777);
+void waitForRequest(REQUEST *request){
+    int fd = open(CLIENT_SERVER,O_RDONLY);
+    read(fd,&(*request),sizeof(struct request));
+    close(fd);
+}
 
+void processRequest(REQUEST *request){
     pid_t pid = fork();
 
     if(pid == 0){
-        _exit(0);
+        pid = fork();
+        if(pid > 0){
+            _exit(0);
+        }else{
+            int pipes[request->pipes][2];
+            pipes[0][1] = open(request->input_path,O_RDONLY);
+            for(int i = 0 ; i < request->pipes ; i++){
+                if(pipe(pipes[i]) != 0){
+                    perror("Pipe error.\n");
+                    exit(EXIT_FAILURE);
+                }
+            }
+            pipes[request->pipes-1][0] = open(request->output_path,O_WRONLY|O_CREAT|O_TRUNC,0777);
+
+            for (int i = 0; i < request->pipes + 1; ++i) {
+                pid = fork();
+                if(pid == 0 && i == 0){
+                    ssize_t bytes_read;
+                    int fd = open(request->input_path,O_RDONLY);
+                    while((bytes_read = read(fd,g_buffer,1024)) > 0){
+                        write(pipes[i][1],g_buffer,bytes_read);
+                    }
+                    close(fd);
+                    close(pipes[i][0])
+                    dup2(pipes[i][0],STDIN_FILENO);
+                    execl(g_exec_commands[request->items[i]],g_exec_commands[request->items[i]],NULL);
+                    _exit(-1);
+                }
+                else if(pid == 0 && i == request->pipes){
+                    execl(g_exec_commands[request->items[i]],g_exec_commands[request->items[i]],NULL);
+                    _exit(-1);
+                }
+                else if(pid == 0){
+                    execl(g_exec_commands[request->items[i]],g_exec_commands[request->items[i]],NULL);
+                    _exit(-1);
+                }
+            }
+            for (int i = 0; i < request->pipes + 1; ++i) {
+                wait(NULL);
+            }
+
+            int fd = openFileDescriptor(request->sender,O_WRONLY);
+            writeToFile(fd,"Done.");
+            close(fd);
+            _exit(0);
+        }
     }
-}
-
-void assignRequest(REQUEST request){
-
-        int fd = openFileDescriptor(CLIENT_SERVER,O_WRONLY);
-        kill(getRequestSender(request),SIGUSR1);
-        sleep(1);
-        close(fd);
-
-
 }
 
 int main(int argc , char *argv[]) {
@@ -319,29 +362,9 @@ int main(int argc , char *argv[]) {
 
     g_running_status = ONLINE;
     while(g_running_status == ONLINE){
-        REQUEST request = NULL;
-        int fd = openFileDescriptor(CLIENT_SERVER,O_RDONLY);
-        readRequest(fd,&request);
-        close(fd);
-        char fifo[1024];
-        sprintf(fifo,"/tmp/%d", getRequestSender(request));
-        switch (getRequestType(request)) {
-            case PROC_FILE:
-                g_task_monitor[g_curr_task][0] = getRequestSender(request);
-                g_task_monitor[g_curr_task][1] = fork();
-                if(g_task_monitor[g_curr_task][1] == 0){
-                    fd = openFileDescriptor(fifo,O_WRONLY);
-                    kill(getRequestSender(request),SIGUSR1);
-                    _exit(0);
-                }
-                g_curr_task++;
-                break;
-            case STATUS:
-                break;
-            default:
-                errorHandler(INVALID_OP,"invalid operation.\n");
-                break;
-        }
+        REQUEST request;
+        waitForRequest(&request);
+        processRequest(&request);
     }
     unlink(CLIENT_SERVER);
     return 0;
